@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand & Eye Controlled Art</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        canvas { display: block; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        /* UI Overlay */
+        #ui-layer {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            z-index: 10;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .hud-text {
+            color: #fff;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 20px 40px;
+            border: 1px solid rgba(0, 255, 255, 0.3);
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.1);
+            border-radius: 8px;
+            text-align: center;
+            pointer-events: auto;
+            max-width: 90%;
+            backdrop-filter: blur(8px);
+            transition: opacity 0.5s;
+        }
+
+        h1 { margin: 0 0 15px 0; letter-spacing: 4px; font-weight: normal; font-size: 2.5rem; text-transform: uppercase;
+             background: linear-gradient(90deg, #00ffff, #ffffff, #ff00ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        p { color: #ccc; margin: 0 0 25px 0; font-size: 1rem; line-height: 1.6; letter-spacing: 1px; }
+        
+        .gesture-icon { font-size: 1.5rem; margin: 0 5px; }
+        .cmd { color: #00ffcc; font-weight: bold; }
+
+        #loading-text { font-size: 1.2rem; color: #00ffcc; animation: pulse 1s infinite; }
+        
+        button {
+            background: transparent;
+            color: #00ffff;
+            border: 2px solid #00ffff;
+            padding: 15px 40px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            cursor: pointer;
+            pointer-events: auto;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            transition: all 0.3s;
+        }
+        button:hover { background: #00ffff; color: #000; box-shadow: 0 0 30px #00ffff; }
+
+        #status-bar {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #aaa;
+            font-size: 0.9rem;
+            display: none;
+            background: rgba(0,0,0,0.7);
+            padding: 10px 20px;
+            border-radius: 20px;
+            border: 1px solid #333;
+            text-align: left;
+        }
+
+        .status-item { display: block; margin-bottom: 5px; }
+
+        /* Hidden video element for AI processing */
+        #input-video {
+            position: absolute;
+            top: 0; left: 0; width: 320px; height: 240px;
+            opacity: 0; z-index: 0; pointer-events: none;
+        }
+
+        @keyframes pulse { 0% { opacity: 0.5; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body>
+
+    <video id="input-video" playsinline></video>
+
+    <div id="ui-layer">
+        <div id="status-bar">
+            <span class="status-item">👁️ HEAD: <span id="head-val" style="color:#00ffcc">Active</span></span>
+            <span class="status-item">✋ HAND: <span id="hand-val" style="color:#ff0055">Scanning...</span></span>
+        </div>
+
+        <div id="start-screen" class="hud-text">
+            <h1>Elemental Control</h1>
+            <p>
+                <span class="gesture-icon">👁️</span> Head Movement → <b>STEER</b><br>
+                <span class="gesture-icon">🖐️</span> Paper → <b>WARP DRIVE</b><br>
+                <span class="gesture-icon">✊</span> Rock → <b>BLACK HOLE</b><br>
+                <span class="gesture-icon">✌️</span> Scissors → <b>TIME SPIRAL</b>
+            </p>
+            <button id="btn-start">Connect Neural Link</button>
+        </div>
+
+        <div id="loading-screen" class="hud-text" style="display: none;">
+            <div id="loading-text">Loading AI Models (Face + Hands)...</div>
+        </div>
+    </div>
+
+    <!-- Libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- MediaPipe Face Mesh -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <!-- MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <!-- Camera Utils -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+    <script>
+        // --- CONFIGURATION ---
+        const PARTICLE_COUNT = 14000;
+        const CAM_SENSITIVITY = 12.0; 
+        
+        // Physics States
+        const MODES = {
+            NORMAL: 0,
+            WARP: 1,    // Paper
+            IMPLODE: 2, // Rock
+            SPIRAL: 3   // Scissors
+        };
+
+        let currentMode = MODES.NORMAL;
+
+        // Global State
+        let targetX = 0, targetY = 0;
+        let currentX = 0, currentY = 0;
+        let timeOffset = 0;
+        
+        // --- 1. THREE.JS SCENE ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+        scene.fog = new THREE.FogExp2(0x000000, 0.005); 
+        
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 50;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.autoClear = false;
+        document.body.appendChild(renderer.domElement);
+
+        // --- 2. TRAIL EFFECT ---
+        const fadeGeo = new THREE.PlaneGeometry(window.innerWidth * 2, window.innerHeight * 2);
+        const fadeMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.1 });
+        const fadePlane = new THREE.Mesh(fadeGeo, fadeMat);
+        fadePlane.position.z = -1;
+        const fadeScene = new THREE.Scene();
+        fadeScene.add(fadePlane);
+
+        // --- 3. PARTICLES ---
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const colors = new Float32Array(PARTICLE_COUNT * 3);
+        const sizes = new Float32Array(PARTICLE_COUNT);
+        const randoms = new Float32Array(PARTICLE_COUNT); // For noise variation
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const x = (Math.random() - 0.5) * 400;
+            const y = (Math.random() - 0.5) * 400;
+            const z = (Math.random() - 0.5) * 400;
+
+            positions[i * 3] = x;
+            positions[i * 3 + 1] = y;
+            positions[i * 3 + 2] = z;
+
+            colors[i*3] = 1; colors[i*3+1] = 1; colors[i*3+2] = 1;
+            sizes[i] = Math.random() * 2;
+            randoms[i] = Math.random();
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+        // Texture
+        const canvas = document.createElement('canvas');
+        canvas.width = 32; canvas.height = 32;
+        const ctx = canvas.getContext('2d');
+        const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+        grad.addColorStop(0, 'rgba(255,255,255,1)');
+        grad.addColorStop(0.4, 'rgba(255,255,255,0.5)');
+        grad.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0,0,32,32);
+        const texture = new THREE.CanvasTexture(canvas);
+
+        const material = new THREE.PointsMaterial({
+            size: 2,
+            map: texture,
+            vertexColors: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+            transparent: true,
+            opacity: 0.8
+        });
+
+        const points = new THREE.Points(geometry, material);
+        scene.add(points);
+
+        // --- 4. PHYSICS ENGINE ---
+        function updateParticles(headX, headY, time) {
+            const pos = geometry.attributes.position.array;
+            const col = geometry.attributes.color.array;
+            
+            // Base speed settings
+            let zSpeed = 1.0;
+            let spiralStrength = 0.0;
+            let centerPull = 0.0;
+            
+            // Adjust physics based on Hand Mode
+            if (currentMode === MODES.WARP) zSpeed = 8.0; // Paper
+            if (currentMode === MODES.IMPLODE) { zSpeed = 0.2; centerPull = 0.05; } // Rock
+            if (currentMode === MODES.SPIRAL) { zSpeed = 1.5; spiralStrength = 0.05; } // Scissors
+
+            for(let i = 0; i < PARTICLE_COUNT; i++) {
+                let px = pos[i*3];
+                let py = pos[i*3+1];
+                let pz = pos[i*3+2];
+
+                // 1. Z-MOVEMENT
+                pz += zSpeed;
+
+                // 2. STEERING (Head)
+                // Head input shifts the "noise field"
+                const noiseX = Math.sin(py * 0.01 + time) + Math.cos(pz * 0.01);
+                const noiseY = Math.cos(px * 0.01 + time) + Math.sin(pz * 0.01);
+                
+                px += noiseX * 0.2 - (headX * 0.8);
+                py += noiseY * 0.2 + (headY * 0.8);
+
+                // 3. SPECIAL MODES
+                if (currentMode === MODES.IMPLODE) {
+                    // Pull towards center (Black Hole)
+                    px -= px * centerPull;
+                    py -= py * centerPull;
+                }
+                
+                if (currentMode === MODES.SPIRAL) {
+                    // Rotate around Z axis
+                    const oldX = px;
+                    px = px * Math.cos(spiralStrength) - py * Math.sin(spiralStrength);
+                    py = oldX * Math.sin(spiralStrength) + py * Math.cos(spiralStrength);
+                }
+
+                // 4. INFINITE LOOP
+                if (pz > 100) {
+                    pz = -300;
+                    // Respawn randomness
+                    px = (Math.random() - 0.5) * 400;
+                    py = (Math.random() - 0.5) * 400;
+                }
+                if (pz < -300) pz = 100; // Case for reverse gravity if added
+
+                pos[i*3] = px;
+                pos[i*3+1] = py;
+                pos[i*3+2] = pz;
+
+                // 5. COLORING
+                const pColor = new THREE.Color();
+                const depthFactor = (pz + 300) / 400; // 0 to 1
+
+                if (currentMode === MODES.WARP) {
+                    // White/Cyan streaks
+                    pColor.setHSL(0.5, 1.0, 0.8);
+                } else if (currentMode === MODES.IMPLODE) {
+                    // Orange/Red/Black
+                    pColor.setHSL(0.05 + Math.random()*0.1, 1.0, 0.5 * depthFactor);
+                } else if (currentMode === MODES.SPIRAL) {
+                    // Rainbow swirl
+                    const hue = (Math.atan2(py, px) / Math.PI) * 0.5 + 0.5 + time * 0.2;
+                    pColor.setHSL(hue % 1, 1.0, 0.6);
+                } else {
+                    // Normal: Blue/Purple
+                    pColor.setHSL(0.6 + depthFactor * 0.2, 0.8, 0.3 + depthFactor * 0.5);
+                }
+
+                col[i*3] = pColor.r;
+                col[i*3+1] = pColor.g;
+                col[i*3+2] = pColor.b;
+            }
+            
+            geometry.attributes.position.needsUpdate = true;
+            geometry.attributes.color.needsUpdate = true;
+        }
+
+        // --- 5. AI TRACKING LOGIC ---
+        
+        // --- HAND GESTURE CLASSIFIER ---
+        function detectHandGesture(landmarks) {
+            // Finger Tips
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const middleTip = landmarks[12];
+            const ringTip = landmarks[16];
+            const pinkyTip = landmarks[20];
+
+            // Finger Bases (PIP or MCP)
+            const indexPip = landmarks[6];
+            const middlePip = landmarks[10];
+            const ringPip = landmarks[14];
+            const pinkyPip = landmarks[18];
+
+            // Check if fingers are extended (Tip above PIP)
+            // Note: Y increases downwards in screen coords, so Tip < Pip = Extended Up
+            // But hands can rotate. Distance check is safer.
+            // Simplified logic: Check distance from wrist (0)
+            const wrist = landmarks[0];
+            
+            function isExtended(tip, pip) {
+                // If tip is further from wrist than pip, it's likely extended
+                const distTip = Math.hypot(tip.x - wrist.x, tip.y - wrist.y);
+                const distPip = Math.hypot(pip.x - wrist.x, pip.y - wrist.y);
+                return distTip > distPip;
+            }
+
+            const indexOpen = isExtended(indexTip, indexPip);
+            const middleOpen = isExtended(middleTip, middlePip);
+            const ringOpen = isExtended(ringTip, ringPip);
+            const pinkyOpen = isExtended(pinkyTip, pinkyPip);
+
+            // Logic Tree
+            if (indexOpen && middleOpen && ringOpen && pinkyOpen) {
+                return "PAPER";
+            }
+            if (!indexOpen && !middleOpen && !ringOpen && !pinkyOpen) {
+                return "ROCK";
+            }
+            if (indexOpen && middleOpen && !ringOpen && !pinkyOpen) {
+                return "SCISSORS";
+            }
+            return "UNKNOWN";
+        }
+
+        // --- MODELS ---
+        const videoElement = document.getElementById('input-video');
+        const faceMesh = new FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+
+        // FACE CONFIG
+        faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        
+        faceMesh.onResults((results) => {
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                const landmarks = results.multiFaceLandmarks[0];
+                const nose = landmarks[1];
+                
+                // Head Steering
+                const rawX = -(nose.x - 0.5) * 2; 
+                const rawY = -(nose.y - 0.5) * 2;
+                targetX = rawX * CAM_SENSITIVITY;
+                targetY = rawY * CAM_SENSITIVITY;
+            }
+        });
+
+        // HANDS CONFIG
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+
+        hands.onResults((results) => {
+            const statusEl = document.getElementById('hand-val');
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const gesture = detectHandGesture(results.multiHandLandmarks[0]);
+                
+                if (gesture === "PAPER") {
+                    currentMode = MODES.WARP;
+                    statusEl.innerText = "PAPER (WARP)";
+                    statusEl.style.color = "#00ffff";
+                } else if (gesture === "ROCK") {
+                    currentMode = MODES.IMPLODE;
+                    statusEl.innerText = "ROCK (IMPLODE)";
+                    statusEl.style.color = "#ff0000";
+                } else if (gesture === "SCISSORS") {
+                    currentMode = MODES.SPIRAL;
+                    statusEl.innerText = "SCISSORS (SPIRAL)";
+                    statusEl.style.color = "#ff00ff";
+                } else {
+                    currentMode = MODES.NORMAL;
+                    statusEl.innerText = "Unknown";
+                    statusEl.style.color = "#aaa";
+                }
+            } else {
+                currentMode = MODES.NORMAL;
+                statusEl.innerText = "Not Detected";
+                statusEl.style.color = "#aaa";
+            }
+        });
+
+        // --- 6. STARTUP & CAMERA LOOP ---
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                // We send frame to BOTH models
+                await faceMesh.send({image: videoElement});
+                await hands.send({image: videoElement});
+            },
+            width: 320,
+            height: 240
+        });
+
+        document.getElementById('btn-start').addEventListener('click', async () => {
+            document.getElementById('start-screen').style.display = 'none';
+            document.getElementById('loading-screen').style.display = 'block';
+            
+            try {
+                await cameraUtils.start();
+                
+                // Fake delay to allow models to warm up visually
+                setTimeout(() => {
+                    document.getElementById('loading-screen').style.display = 'none';
+                    document.getElementById('status-bar').style.display = 'block';
+                }, 2000);
+
+            } catch (e) {
+                alert("Camera Access Required!");
+            }
+        });
+
+        // --- 7. RENDER LOOP ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            timeOffset += delta;
+
+            // Smooth Camera Interpolation
+            const dx = targetX - currentX;
+            const dy = targetY - currentY;
+            currentX += dx * 0.05;
+            currentY += dy * 0.05;
+
+            // Tilt Camera based on head
+            camera.rotation.y = -currentX * 0.02;
+            camera.rotation.x = currentY * 0.02;
+
+            // Update Physics
+            updateParticles(currentX, currentY, timeOffset);
+
+            // Render Trails + Scene
+            renderer.render(fadeScene, camera);
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            renderer.setSize(w, h);
+            fadePlane.geometry = new THREE.PlaneGeometry(w * 2, h * 2);
+        });
+
+        animate();
+
+    </script>
+</body>
+</html>
